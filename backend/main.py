@@ -16,7 +16,12 @@ app = FastAPI(title="Video Chat API", version="1.0.0")
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],  # React dev server
+    allow_origins=[
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173",
+        "http://localhost:3000", 
+        "http://127.0.0.1:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -25,43 +30,17 @@ app.add_middleware(
 # Store active connections
 active_connections = {}
 
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections = {}
-
-    async def connect(self, websocket: WebSocket, client_id: str):
-        await websocket.accept()
-        gemini_client = GeminiVideoChat()
-        self.active_connections[client_id] = {
-            "websocket": websocket,
-            "gemini_client": gemini_client
-        }
-        logger.info(f"Client {client_id} connected")
-        return gemini_client
-
-    async def disconnect(self, client_id: str):
-        if client_id in self.active_connections:
-            try:
-                await self.active_connections[client_id]["gemini_client"].cleanup()
-                logger.info(f"Client {client_id} disconnected and cleaned up")
-            except Exception as e:
-                logger.error(f"Error during cleanup for client {client_id}: {e}")
-            finally:
-                del self.active_connections[client_id]
-
-    async def send_message(self, client_id: str, message: dict):
-        if client_id in self.active_connections:
-            try:
-                websocket = self.active_connections[client_id]["websocket"]
-                await websocket.send_text(json.dumps(message))
-            except Exception as e:
-                logger.error(f"Error sending message to client {client_id}: {e}")
-
-manager = ConnectionManager()
-
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    gemini_client = await manager.connect(websocket, client_id)
+    await websocket.accept()
+    logger.info(f"Client {client_id} connected")
+    
+    # Create Gemini client for this connection
+    gemini_client = GeminiVideoChat()
+    active_connections[client_id] = {
+        "websocket": websocket,
+        "gemini_client": gemini_client
+    }
     
     try:
         # Start Gemini session
@@ -84,21 +63,19 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         message = json.loads(data)
                         
                         if message["type"] == "video_frame":
-                            # Process video frame
-                            frame_data = base64.b64decode(message["data"])
-                            await gemini_client.send_video_frame(frame_data)
-                            logger.debug(f"Sent video frame from client {client_id}")
+                            # Process video frame - pass base64 data directly
+                            await gemini_client.send_video_frame(message["data"])
+                            logger.info(f"Processed video frame from client {client_id}, size: {len(message['data'])} chars")
                         
                         elif message["type"] == "audio_data":
-                            # Process audio data
-                            audio_data = base64.b64decode(message["data"])
-                            await gemini_client.send_audio_data(audio_data)
-                            logger.debug(f"Sent audio data from client {client_id}")
+                            # Process audio data - pass the base64 string directly
+                            await gemini_client.send_audio_data(message["data"])
+                            logger.info(f"Processed audio data from client {client_id}, size: {len(message['data'])} chars")
                         
                         elif message["type"] == "text_message":
                             # Process text message
                             await gemini_client.send_text(message["text"])
-                            logger.info(f"Sent text message from client {client_id}: {message['text']}")
+                            logger.info(f"Processed text message from client {client_id}: {message['text']}")
                         
                         elif message["type"] == "ping":
                             # Handle ping for connection health
@@ -131,9 +108,19 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             "data": response
                         }))
                         logger.debug(f"Sent response to client {client_id}")
+                        
+                        # Log specific response types
+                        if 'text' in response:
+                            logger.info(f"Sent text response to {client_id}: {response['text'][:50]}...")
+                        if 'audio' in response:
+                            logger.info(f"Sent audio response to {client_id}")
+                        if 'user_transcription' in response:
+                            logger.info(f"User said: {response['user_transcription']}")
+                            
                     except Exception as e:
                         logger.error(f"Error sending response to client {client_id}: {e}")
                         break
+                        
             except Exception as e:
                 logger.error(f"Error in response handler for client {client_id}: {e}")
         
@@ -157,7 +144,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             pass
     finally:
         # Cleanup
-        await manager.disconnect(client_id)
+        if client_id in active_connections:
+            try:
+                await active_connections[client_id]["gemini_client"].cleanup()
+                logger.info(f"Cleaned up client {client_id}")
+            except Exception as e:
+                logger.error(f"Error during cleanup for client {client_id}: {e}")
+            finally:
+                del active_connections[client_id]
 
 @app.get("/")
 async def root():
@@ -165,6 +159,7 @@ async def root():
         "message": "Video Chat API is running",
         "version": "1.0.0",
         "status": "healthy",
+        "model": "gemini-2.0-flash-live-preview-04-09",
         "endpoints": {
             "websocket": "/ws/{client_id}",
             "health": "/health"
@@ -175,13 +170,25 @@ async def root():
 async def health_check():
     return {
         "status": "healthy",
-        "active_connections": len(manager.active_connections)
+        "active_connections": len(active_connections),
+        "connection_ids": list(active_connections.keys())
     }
+
+@app.get("/test")
+async def test_gemini():
+    """Test endpoint to verify Gemini connection"""
+    try:
+        from gemini_client import test_gemini_client
+        await test_gemini_client()
+        return {"status": "success", "message": "Gemini connection test passed"}
+    except Exception as e:
+        return {"status": "error", "message": f"Gemini connection test failed: {str(e)}"}
 
 if __name__ == "__main__":
     import uvicorn
+    logger.info("Starting Video Chat API server...")
     uvicorn.run(
-        "main:app",  # Use import string instead of app object
+        "main:app",
         host="0.0.0.0", 
         port=8000,
         log_level="info",
